@@ -12,6 +12,10 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
+from PIL import Image
+import io
+from utils.images import openai_requirements_image_resize, encode_image_to_data_url
+from config import MAX_IMAGES_PER_MESSAGE
 
 """
 Note:
@@ -56,9 +60,16 @@ Aber der Benutzer tippt nicht gerne, also versuchen Sie, unnötige Fragen zu ver
 Verwenden Sie die Sprache des Benutzers, es sei denn, eine Aufgabe erfordert etwas anderes.
 """
 
-MAX_MESSAGES_NUM = 50
+MAX_MESSAGES_NUM = 100
+MAX_IMAGE_SIZE_MB = 30
 
 MESSAGES_BY_USER = {}
+
+def is_file_too_large(file_size_bytes: int | None, max_size_mb: int) -> bool:
+    try:
+        return isinstance(file_size_bytes, int) and file_size_bytes > max_size_mb * 1024 * 1024
+    except Exception:
+        return False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,6 +123,7 @@ def update_provider_from_user_input(user_input):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print("In the handle_message function...")
     user_id = update.effective_user.id
 
     if user_id in ALLOWED_USER_IDS:
@@ -168,6 +180,189 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(answer)
 
 
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print("In the handle_photo_message function...")
+    user_id = update.effective_user.id
+
+    if user_id in ALLOWED_USER_IDS:
+        try:
+            # Reject media groups (albums) when only 1 image per message is allowed
+            if update.message.media_group_id is not None and MAX_IMAGES_PER_MESSAGE == 1:
+                msg = f"Too many images in one message (album). Allowed: {MAX_IMAGES_PER_MESSAGE}."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+            photos = update.message.photo
+            if not photos:
+                await update.message.reply_text("got an image")
+                return
+            # Debug: Telegram PhotoSize reported size
+            reported_photo_size = getattr(photos[-1], "file_size", None)
+            print(f"DEBUG(photo): PhotoSize.file_size={reported_photo_size} bytes")
+            # Pre-check size (Telegram photo sizes are server-compressed, so we also check post-download size below)
+            if is_file_too_large(getattr(photos[-1], "file_size", None), MAX_IMAGE_SIZE_MB):
+                msg = f"File size exceeds the maximum limit of {MAX_IMAGE_SIZE_MB}MB. Please send a smaller image."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+
+            file_id = photos[-1].file_id
+            file = await context.bot.get_file(file_id)
+            # Debug: Telegram File reported size
+            reported_file_size = getattr(file, "file_size", None)
+            print(f"DEBUG(photo): File.file_size={reported_file_size} bytes")
+            if is_file_too_large(getattr(file, "file_size", None), MAX_IMAGE_SIZE_MB):
+                msg = f"File size exceeds the maximum limit of {MAX_IMAGE_SIZE_MB}MB. Please send a smaller image."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+
+            bio = io.BytesIO()
+            await file.download_to_memory(out=bio)
+            # Post-download size check (definitive)
+            bytes_len = bio.getbuffer().nbytes
+            print(f"DEBUG(photo): downloaded bytes_len={bytes_len} bytes (~{bytes_len/1024/1024:.2f} MB)")
+            if is_file_too_large(bytes_len, MAX_IMAGE_SIZE_MB):
+                msg = f"File size exceeds the maximum limit of {MAX_IMAGE_SIZE_MB}MB. Please send a smaller image."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+            bio.seek(0)
+            img = Image.open(bio)
+            w, h = img.size
+            print(f"DEBUG(photo): original downloaded image size={w}x{h}")
+
+            # Resize to OpenAI requirements and encode
+            img_resized = openai_requirements_image_resize(img)
+            rw, rh = img_resized.size
+            print(f"DEBUG(photo): resized image size={rw}x{rh}")
+            data_url = encode_image_to_data_url(img_resized, fmt="JPEG")
+
+            image_content = {"type": "image_url", "image_url": {"url": data_url}}
+            content_parts = []
+            if isinstance(update.message.caption, str) and len(update.message.caption.strip()) > 0:
+                print(f"DEBUG(photo): caption_len={len(update.message.caption.strip())}")
+                content_parts.append({"type": "text", "text": update.message.caption.strip()})
+            content_parts.append(image_content)
+
+            if user_id in MESSAGES_BY_USER:
+                MESSAGES_BY_USER[user_id].append({"role": "user", "content": content_parts})
+            else:
+                MESSAGES_BY_USER[user_id] = [
+                    {"role": "system", "content": SYSTEM_MSG},
+                    {"role": "user", "content": content_parts},
+                ]
+
+            answer = ask_gpt_multi_message(
+                MESSAGES_BY_USER[user_id],
+                max_length=500,
+                user_defined_provider=SELECTED_PROVIDER,
+            )
+
+            MESSAGES_BY_USER[user_id].append({"role": "assistant", "content": answer})
+            if len(MESSAGES_BY_USER[user_id]) > MAX_MESSAGES_NUM:
+                MESSAGES_BY_USER[user_id] = MESSAGES_BY_USER[user_id][-MAX_MESSAGES_NUM:]
+                MESSAGES_BY_USER[user_id].insert(0, {"role": "system", "content": SYSTEM_MSG})
+
+            await update.message.reply_text(answer)
+        except Exception as e:
+            print(f"Error handling photo: {e}")
+            await update.message.reply_text("Sorry, failed to process the image.")
+    else:
+        answer = f"Eh? Du hast doch keine Berechtigung. Deine user_id ist {user_id}."
+        print(answer)
+        await update.message.reply_text(answer)
+
+async def handle_image_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print("In the handle_image_document_message function...")
+    user_id = update.effective_user.id
+
+    if user_id in ALLOWED_USER_IDS:
+        try:
+            # Reject media groups (albums) for documents as well when limit is 1
+            if update.message.media_group_id is not None and MAX_IMAGES_PER_MESSAGE == 1:
+                msg = f"Too many images in one message (album). Allowed: {MAX_IMAGES_PER_MESSAGE}."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+            doc = update.message.document
+            if not doc or not isinstance(doc.mime_type, str) or not doc.mime_type.startswith("image/"):
+                return
+            print(f"DEBUG(doc): name={getattr(doc, 'file_name', None)}, mime={doc.mime_type}, file_size={getattr(doc, 'file_size', None)} bytes")
+            # Pre-check size on the document (original size preserved for documents)
+            if is_file_too_large(getattr(doc, "file_size", None), MAX_IMAGE_SIZE_MB):
+                msg = f"File size exceeds the maximum limit of {MAX_IMAGE_SIZE_MB}MB. Please send a smaller image."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+
+            file = await context.bot.get_file(doc.file_id)
+            print(f"DEBUG(doc): File.file_size={getattr(file, 'file_size', None)} bytes")
+            if is_file_too_large(getattr(file, "file_size", None), MAX_IMAGE_SIZE_MB):
+                msg = f"File size exceeds the maximum limit of {MAX_IMAGE_SIZE_MB}MB. Please send a smaller image."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+
+            bio = io.BytesIO()
+            await file.download_to_memory(out=bio)
+            bytes_len = bio.getbuffer().nbytes
+            print(f"DEBUG(doc): downloaded bytes_len={bytes_len} bytes (~{bytes_len/1024/1024:.2f} MB)")
+            if is_file_too_large(bytes_len, MAX_IMAGE_SIZE_MB):
+                msg = f"File size exceeds the maximum limit of {MAX_IMAGE_SIZE_MB}MB. Please send a smaller image."
+                print(msg)
+                await update.message.reply_text(msg)
+                return
+            bio.seek(0)
+            img = Image.open(bio)
+            w, h = img.size
+            print(f"DEBUG(doc): original downloaded image size={w}x{h}")
+
+            img_resized = openai_requirements_image_resize(img)
+            rw, rh = img_resized.size
+            print(f"DEBUG(doc): resized image size={rw}x{rh}")
+            # Preserve format when reasonable, default to JPEG
+            fmt = "JPEG"
+            if isinstance(doc.mime_type, str) and "png" in doc.mime_type:
+                fmt = "PNG"
+            data_url = encode_image_to_data_url(img_resized, fmt=fmt)
+
+            image_content = {"type": "image_url", "image_url": {"url": data_url}}
+            content_parts = []
+            if isinstance(update.message.caption, str) and len(update.message.caption.strip()) > 0:
+                print(f"DEBUG(doc): caption_len={len(update.message.caption.strip())}")
+                content_parts.append({"type": "text", "text": update.message.caption.strip()})
+            content_parts.append(image_content)
+
+            if user_id in MESSAGES_BY_USER:
+                MESSAGES_BY_USER[user_id].append({"role": "user", "content": content_parts})
+            else:
+                MESSAGES_BY_USER[user_id] = [
+                    {"role": "system", "content": SYSTEM_MSG},
+                    {"role": "user", "content": content_parts},
+                ]
+
+            answer = ask_gpt_multi_message(
+                MESSAGES_BY_USER[user_id],
+                max_length=500,
+                user_defined_provider=SELECTED_PROVIDER,
+            )
+
+            MESSAGES_BY_USER[user_id].append({"role": "assistant", "content": answer})
+            if len(MESSAGES_BY_USER[user_id]) > MAX_MESSAGES_NUM:
+                MESSAGES_BY_USER[user_id] = MESSAGES_BY_USER[user_id][-MAX_MESSAGES_NUM:]
+                MESSAGES_BY_USER[user_id].insert(0, {"role": "system", "content": SYSTEM_MSG})
+
+            await update.message.reply_text(answer)
+        except Exception as e:
+            print(f"Error handling image document: {e}")
+            await update.message.reply_text("Sorry, failed to process the image document.")
+    else:
+        answer = f"Eh? Du hast doch keine Berechtigung. Deine user_id ist {user_id}."
+        print(answer)
+        await update.message.reply_text(answer)
+
+
 async def restrict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = f"Keine Berechtigung für user_id {user_id}."
@@ -179,6 +374,7 @@ async def restrict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    print("In the main function...")
     app = Application.builder().token(TOKEN).build()
 
     """Restrict fhs bot to the specified user_id.
@@ -189,6 +385,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(start_game_callback, pattern="^start_game$"))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_image_document_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
